@@ -1,0 +1,209 @@
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+
+enum OrderStatus {
+  // ---- Online-payment lifecycle ----
+  PENDING_PAYMENT   // Razorpay order created, awaiting a captured payment. Set by the system only.
+  PAYMENT_FAILED    // Payment attempt failed / was abandoned. Set by the system only.
+
+  // ---- Confirmed order lifecycle (both ONLINE and COD) ----
+  CONFIRMED         // Payment captured (ONLINE) or order accepted (COD). Stock has been committed.
+  PROCESSING        // Being packed for shipment. Admin-controlled.
+  SHIPPED           // Dispatched with a tracking number. Admin-controlled.
+  DELIVERED         // Delivered to the customer. Admin-controlled.
+
+  // ---- Terminal / exception states ----
+  CANCELLED         // Cancelled before shipping. Stock is released back.
+  REFUNDED          // Money returned to the customer (via Razorpay for ONLINE, recorded manually for COD).
+
+  // ---- Legacy values -----------------------------------------------------
+  // Kept ONLY so orders created before this schema version remain readable
+  // (Prisma validates enum values on read, and MongoDB has no migration
+  // step of its own). Run `npx tsx scripts/migrateOrderStatus.ts` once
+  // against the database to rewrite these to their modern equivalents:
+  //   PENDING -> CONFIRMED, PAID -> CONFIRMED, COMPLETED -> DELIVERED
+  // New code must never write these three values.
+  PENDING
+  PAID
+  COMPLETED
+}
+
+enum PaymentMethod {
+  ONLINE
+  COD
+}
+
+
+model User {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  email        String   @unique
+  passwordHash String
+  phone        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Product {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  slug          String   @unique
+  name          String
+  description   String?
+  fabric        String
+  weight        String
+  style         String
+  tier          String
+  tones         String[]
+  occasions     String[]
+  price         Int
+  images        String[]
+  isNew         Boolean  @default(false)
+  isFeatured    Boolean  @default(false)
+  featuredOrder Int      @default(0)
+  isActive      Boolean  @default(true)
+
+  // Inventory. Existing products created before this field was introduced
+  // will not have it set in MongoDB — run `npx tsx scripts/backfillProductStock.ts`
+  // immediately after deploying this schema (before any customer traffic hits
+  // the new code) so every product resolves to a real, admin-reviewed count.
+  stock         Int      @default(0)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model AdvisorSession {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  answers         Json
+  answersHash     String
+  recommendations Json
+  createdAt       DateTime @default(now())
+
+  @@index([answersHash])
+}
+
+model ConversionEvent {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  type            String   // "wishlist" | "inquiry"
+  productId       String?
+  advisorSessionId String?
+  createdAt       DateTime @default(now())
+}
+
+model BusinessInquiry {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  company   String?
+  email     String
+  message   String
+  ip        String?
+  resolved  Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+// Embedded (composite) document — deliberately OPTIONAL on Order (see below)
+// so that orders placed before addresses were collected keep reading fine.
+type ShippingAddress {
+  fullName   String
+  phone      String
+  line1      String
+  line2      String?
+  landmark   String?
+  city       String
+  state      String
+  postalCode String
+  country    String @default("India")
+}
+
+model Order {
+  id        String      @id @default(auto()) @map("_id") @db.ObjectId
+  reference String      @unique
+  name      String
+  contact   String
+  notes     String?
+  total     Int
+
+  status        OrderStatus   @default(PENDING_PAYMENT)
+  paymentMethod PaymentMethod @default(ONLINE)
+
+  // Optional at the schema level on purpose: orders created before this
+  // release have no address on file. The API layer requires a real,
+  // validated address for every NEW order regardless of this being
+  // nullable here — see src/lib/orders.ts#validateShippingAddress.
+  shippingAddress ShippingAddress?
+
+  // Best-effort link to a logged-in customer account, so "My Orders"
+  // can find an order even if it was placed with a phone number instead
+  // of the account email. Never required — guest checkout stays guest.
+  userId String? @db.ObjectId
+
+  // ---- Razorpay linkage --------------------------------------------------
+  // These are the ONLY reliable identifiers for an online payment. Razorpay
+  // itself guarantees razorpayOrderId is unique, so it is not re-declared
+  // @unique here (Mongo unique indexes reject a second `null`, which every
+  // COD order would have — see the P2002 footgun documented at
+  // github.com/prisma/prisma/issues/23870). A plain index is enough for
+  // fast lookups from the webhook and the verify route.
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+
+  // Client-generated (crypto.randomUUID) idempotency guard so a network
+  // retry or a double-click on "Pay" can never create two orders for the
+  // same checkout attempt. Same non-unique-index reasoning as above.
+  idempotencyKey String?
+
+  // ---- Fulfilment ---------------------------------------------------------
+  trackingNumber String?
+  courierName    String?
+  cancelReason   String?
+
+  // Guards against crediting stock back twice if cancel/refund logic is
+  // ever triggered more than once for the same order.
+  stockReleased Boolean @default(false)
+
+  // ---- Lifecycle timestamps ----
+  confirmedAt DateTime?
+  shippedAt   DateTime?
+  deliveredAt DateTime?
+  cancelledAt DateTime?
+  refundedAt  DateTime?
+
+  items     OrderItem[]
+
+  createdAt DateTime    @default(now())
+
+  @@index([createdAt])
+  @@index([contact])
+  @@index([status])
+  @@index([razorpayOrderId])
+  @@index([idempotencyKey])
+  @@index([userId])
+}
+
+
+model OrderItem {
+  id        String  @id @default(auto()) @map("_id") @db.ObjectId
+  productId String
+  name      String
+  price     Int
+  quantity  Int
+
+  orderId   String? @db.ObjectId
+  order     Order?  @relation(fields: [orderId], references: [id])
+
+  @@index([productId])
+}
+
+model SiteSetting {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+}
